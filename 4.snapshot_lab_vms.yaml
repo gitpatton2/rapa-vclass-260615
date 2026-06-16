@@ -1,0 +1,79 @@
+---
+- name: Manage lab VM snapshots
+  hosts: localhost
+  gather_facts: false
+  vars_prompt:
+    - name: "student_id"
+      prompt: "Enter student_id"
+      default: "S00"
+      private: no
+    - name: "snapshot_action"
+      prompt: "Snapshot action (present/revert/absent/remove_all)"
+      default: "present"
+      private: no
+    - name: "lab_snapshot_name"
+      prompt: "Snapshot name"
+      default: "lab_base"
+      private: no
+  vars:
+    vcenter_hostname: "vcsa.vclass.rapa"
+    vcenter_username: "{{ student_id | lower }}@vclass.rapa"
+    vcenter_password: "VMware123!"
+    datacenter_name: "Mokdong"
+    parent_folder: "2.vClass/"
+    Linux_VMs:
+      - { hostname: k8s-api-proxy-1, ip: 10.10.10.11 }
+      - { hostname: k8s-api-proxy-2, ip: 10.10.10.12 }
+      - { hostname: k8s-cp-1, ip: 10.10.10.21 }
+      - { hostname: k8s-cp-2, ip: 10.10.10.22 }
+      - { hostname: k8s-cp-3, ip: 10.10.10.23 }
+  tasks:
+    - name: Validate snapshot action
+      assert:
+        that:
+          - snapshot_action in ['present', 'revert', 'absent', 'remove_all']
+        fail_msg: "snapshot_action must be one of present, revert, absent, remove_all"
+
+    - name: Create or remove a named snapshot for lab VM
+      vmware.vmware.vm_snapshot:
+        hostname: '{{ vcenter_hostname }}'
+        username: '{{ vcenter_username }}'
+        password: '{{ vcenter_password }}'
+        validate_certs: no
+        datacenter: '{{ datacenter_name }}'
+        folder: '{{ parent_folder }}{{ student_id }}'
+        name: '{{ student_id }}-{{ item.hostname }}'
+        state: "{{ 'absent' if snapshot_action in ['absent', 'remove_all'] else 'present' }}"
+        snapshot_name: '{{ lab_snapshot_name }}'
+        remove_all: '{{ snapshot_action == "remove_all" }}'
+        description: 'Lab base restore point for {{ item.hostname }}'
+      loop: '{{ Linux_VMs }}'
+      when: snapshot_action != 'revert'
+      delegate_to: localhost
+
+    - name: Revert lab VM to snapshot
+      vmware.vmware.vm_snapshot_revert:
+        hostname: '{{ vcenter_hostname }}'
+        username: '{{ vcenter_username }}'
+        password: '{{ vcenter_password }}'
+        validate_certs: no
+        datacenter: '{{ datacenter_name }}'
+        folder: '{{ parent_folder }}{{ student_id }}'
+        name: '{{ student_id }}-{{ item.hostname }}'
+        snapshot_name: '{{ lab_snapshot_name }}'
+      loop: '{{ Linux_VMs }}'
+      when: snapshot_action == 'revert'
+      delegate_to: localhost
+
+    - name: Power on VMs after snapshot revert
+      community.vmware.vmware_guest:
+        hostname: '{{ vcenter_hostname }}'
+        username: '{{ vcenter_username }}'
+        password: '{{ vcenter_password }}'
+        validate_certs: no
+        name: '{{ student_id }}-{{ item.hostname }}'
+        folder: '{{ parent_folder }}{{ student_id }}'
+        state: poweredon
+      when: snapshot_action == 'revert'
+      loop: '{{ Linux_VMs }}'
+      delegate_to: localhost

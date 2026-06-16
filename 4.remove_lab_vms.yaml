@@ -1,0 +1,30 @@
+---
+- name: Delete deployed Linux VMs
+  hosts: localhost
+  gather_facts: false
+  vars:
+    student_id: "S00"   ## 필요한 경우 실제 student_id로 변경하세요.
+    vcenter_hostname: "vcsa.vclass.rapa"
+    vcenter_username: "{{ student_id | lower }}@vclass.rapa"
+    vcenter_password: "VMware123!"
+    datacenter_name: "Mokdong"
+    parent_folder: "2.vClass/"
+    Linux_VMs:
+      - { hostname: k8s-api-proxy-1, ip: 10.10.10.11 }
+      - { hostname: k8s-api-proxy-2, ip: 10.10.10.12 }
+      - { hostname: k8s-cp-1, ip: 10.10.10.21 }
+      - { hostname: k8s-cp-2, ip: 10.10.10.22 }
+      - { hostname: k8s-cp-3, ip: 10.10.10.23 }
+  tasks:
+    - name: Delete deployed Linux VM
+      community.vmware.vmware_guest:
+        hostname: '{{ vcenter_hostname }}'
+        username: '{{ vcenter_username }}'
+        password: '{{ vcenter_password }}'
+        validate_certs: no
+        name: '{{ student_id }}-{{ item.hostname }}'
+        folder: '{{ parent_folder }}{{ student_id }}'
+        state: absent
+        force: yes
+      loop: '{{ Linux_VMs }}'
+      delegate_to: localhost
