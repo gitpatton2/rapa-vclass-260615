@@ -1,0 +1,33 @@
+vrrp_script check_haproxy {
+    script "killall -0 haproxy"
+    interval 2
+    weight -20
+}
+
+vrrp_instance VI_1 {
+    state {{ 'MASTER' if inventory_hostname == groups['loadbalancers'][0] else 'BACKUP' }}
+    # Ubuntu/VMware 는 NIC 이름이 eth0 가 아닐 수 있어 기본 라우트 인터페이스를 자동 감지.
+    # 필요 시 -e keepalived_interface=ens160 또는 그룹변수로 덮어쓸 수 있음.
+    interface {{ keepalived_interface | default(ansible_default_ipv4.interface) }}
+    virtual_router_id 51
+    priority {{ 100 if inventory_hostname == groups['loadbalancers'][0] else 90 }}
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass 4321
+    }
+    unicast_src_ip {{ ansible_host }}
+    unicast_peer {
+        {% for host in groups['loadbalancers'] %}
+        {% if hostvars[host]['ansible_host'] != ansible_host %}
+        {{ hostvars[host]['ansible_host'] }}
+        {% endif %}
+        {% endfor %}
+    }
+    virtual_ipaddress {
+        {{ virtual_ip }}/24
+    }
+    track_script {
+        check_haproxy
+    }
+}

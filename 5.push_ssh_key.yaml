@@ -1,0 +1,40 @@
+---
+- name: 0) 제어 노드 SSH 키페어 준비
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: SSH 키페어 생성 (이미 있으면 건너뜀)
+      ansible.builtin.command:
+        cmd: ssh-keygen -t rsa -b 4096 -N "" -f {{ lookup('env','HOME') }}/.ssh/id_rsa
+        creates: "{{ lookup('env','HOME') }}/.ssh/id_rsa"
+
+- name: 1) 모든 노드의 ubuntu 계정에 공개키 등록
+  hosts: k8s_cluster
+  gather_facts: false
+  vars_prompt:
+    - name: ssh_password
+      prompt: "Linux VM ubuntu 계정 비밀번호를 입력하세요"
+      private: true
+      unsafe: true
+  tasks:
+    - name: ~/.ssh 디렉토리 보장
+      ansible.builtin.file:
+        path: ~/.ssh
+        state: directory
+        mode: '0700'
+
+    - name: authorized_keys 에 제어 노드 공개키 등록
+      ansible.posix.authorized_key:
+        user: "{{ ansible_user }}"
+        state: present
+        key: "{{ lookup('file', lookup('env','HOME') ~ '/.ssh/id_rsa.pub') }}"
+
+- name: 2) 키 기반 접속 검증 (비밀번호 미사용)
+  hosts: k8s_cluster
+  gather_facts: false
+  vars:
+    ansible_become: false
+    ansible_ssh_common_args: "-o PreferredAuthentications=publickey -o PubkeyAuthentication=yes"
+  tasks:
+    - name: ping (공개키 인증)
+      ansible.builtin.ping:
