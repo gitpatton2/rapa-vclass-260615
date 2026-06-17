@@ -1,0 +1,86 @@
+---
+- name: 로드밸런서(HAProxy/Keepalived) 구성 - Ubuntu 24.04
+  hosts: loadbalancers
+  become: true
+  vars_prompt:
+    - name: ssh_password
+      prompt: "ubuntu 계정 sudo 비밀번호 (passwordless sudo 면 비워도 됨)"
+      private: true
+      unsafe: true
+
+  tasks:
+    - name: 필수 패키지 설치 (haproxy/keepalived/psmisc/iptables-persistent)
+      ansible.builtin.apt:
+        name:
+          - haproxy
+          - keepalived
+          - psmisc                # killall (keepalived check_haproxy 스크립트에서 사용)
+          - iptables-persistent   # netfilter-persistent (방화벽 영구 저장)
+        state: present
+        update_cache: true
+
+    - name: HAProxy 시스템 그룹 생성
+      ansible.builtin.group:
+        name: haproxy
+        system: true
+        state: present
+
+    - name: HAProxy 시스템 유저 생성
+      ansible.builtin.user:
+        name: haproxy
+        group: haproxy
+        system: true
+        shell: /usr/sbin/nologin   # Ubuntu 경로 (Photon 은 /sbin/nologin)
+        create_home: false
+        state: present
+
+    - name: HAProxy 실행용 디렉토리 생성
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: haproxy
+        group: haproxy
+        mode: '0755'
+      loop:
+        - /var/lib/haproxy
+        - /run/haproxy
+
+    - name: HAProxy/Keepalived 설정 파일 배포
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+      loop:
+        - { src: 'haproxy.cfg.j2',     dest: '/etc/haproxy/haproxy.cfg' }
+        - { src: 'keepalived.conf.j2', dest: '/etc/keepalived/keepalived.conf' }
+      notify: restart services
+
+    - name: 커널 파라미터 최적화 (VIP 바인딩 및 포워딩)
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: true
+      loop:
+        - { name: 'net.ipv4.ip_forward',        value: '1' }
+        - { name: 'net.ipv4.ip_nonlocal_bind',  value: '1' }   # BACKUP 노드도 VIP 바인딩 가능
+
+    - name: 방화벽 규칙 적용 및 영구 저장 (6443, VRRP)
+      ansible.builtin.shell: |
+        iptables -C INPUT -p tcp --dport 6443 -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport 6443 -j ACCEPT
+        iptables -C INPUT -p vrrp -j ACCEPT 2>/dev/null || iptables -A INPUT -p vrrp -j ACCEPT
+        netfilter-persistent save
+      changed_when: true
+
+    - name: 서비스 시작 및 활성화
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop: [keepalived, haproxy]
+
+  handlers:
+    - name: restart services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: restarted
+      loop: [keepalived, haproxy]
