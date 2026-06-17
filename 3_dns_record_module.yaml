@@ -1,0 +1,44 @@
+# =====================================================================
+#  방식 A) 컬렉션 모듈 (community.windows.win_dns_record)
+#    - 선언적/멱등: state=present 로 "있어야 할 상태" 를 기술
+#    - 재실행해도 안전, 변경 시에만 changed 보고
+#  실행:  ansible-playbook -i 3_inventory.yaml 3_dns_record_module.yaml   (실행 시 비밀번호 입력)
+#         또는  WIN_PASSWORD='VMware123!' ansible-playbook -i 3_inventory.yaml 3_dns_record_module.yaml
+#  docs:  https://docs.ansible.com/ansible/latest/collections/community/windows/win_dns_record_module.html
+# =====================================================================
+---
+- name: Manage Forward/Reverse DNS Records (collection module)
+  hosts: dc_svrs
+  gather_facts: false
+  vars_prompt:
+    - name: win_password
+      prompt: "Windows 비밀번호를 입력하세요 (administrator)"
+      private: true
+      unsafe: true
+  vars:
+    DNS_Records:
+      - { name: k8s-api,     ip: 10.10.10.10 }
+      - { name: k8s-proxy-1, ip: 10.10.10.11 }
+      - { name: k8s-proxy-2, ip: 10.10.10.12 }
+      - { name: k8s-cp-1,    ip: 10.10.10.21 }
+      - { name: k8s-cp-2,    ip: 10.10.10.22 }
+      - { name: k8s-cp-3,    ip: 10.10.10.23 }
+
+  tasks:
+    - name: Add forward (A) records
+      community.windows.win_dns_record:
+        state: present
+        name: "{{ item.name }}"
+        type: A
+        value: "{{ item.ip }}"
+        zone: vclass.local
+      loop: "{{ DNS_Records }}"
+
+    - name: Add reverse (PTR) records
+      community.windows.win_dns_record:
+        state: present
+        name: "{{ item.ip.split('.')[-1] }}"
+        type: PTR
+        value: "{{ item.name }}.vclass.local"
+        zone: 10.10.10.in-addr.arpa
+      loop: "{{ DNS_Records }}"
