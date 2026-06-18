@@ -1,0 +1,221 @@
+---
+- name: "1단계 - 컨트롤 플레인 공통 준비 (Ubuntu 24.04)"
+  hosts: control_plane
+  become: true
+  vars_prompt:
+    - name: ssh_password
+      prompt: "ubuntu 계정 sudo 비밀번호 (passwordless sudo 면 비워도 됨)"
+      private: true
+      unsafe: true
+
+  tasks:
+    - name: (공통) Swap 비활성화 (즉시 + fstab 주석)
+      ansible.builtin.shell: |
+        swapoff -a
+        sed -ri '/\sswap\s/s/^/#/' /etc/fstab
+      changed_when: false
+
+    - name: (공통) 커널 모듈 영구 로드 설정
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: "overlay\nbr_netfilter\n"
+        mode: '0644'
+
+    - name: (공통) 커널 모듈 즉시 로드
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop: [overlay, br_netfilter]
+
+    - name: (공통) Sysctl 설정 적용
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        sysctl_file: /etc/sysctl.d/k8s.conf
+        reload: true
+      loop:
+        - { name: 'net.bridge.bridge-nf-call-iptables',  value: '1' }
+        - { name: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { name: 'net.ipv4.ip_forward',                 value: '1' }
+
+    - name: (공통) 사전 패키지 + containerd + iptables-persistent 설치
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gpg
+          - containerd
+          - iptables-persistent
+        state: present
+        update_cache: true
+
+    - name: (공통) apt keyrings 디렉토리 생성
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: (공통) Kubernetes apt 저장소 GPG 키 등록
+      ansible.builtin.shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/{{ k8s_pkg_minor }}/deb/Release.key \
+          | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: (공통) Kubernetes apt 저장소 등록
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ k8s_pkg_minor }}/deb/ /\n"
+        mode: '0644'
+
+    - name: (공통) kubelet / kubeadm / kubectl 설치
+      ansible.builtin.apt:
+        name: [kubelet, kubeadm, kubectl]
+        state: present
+        update_cache: true
+
+    - name: (공통) kube 패키지 버전 고정 (hold)
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: [kubelet, kubeadm, kubectl]
+
+    - name: (공통) Containerd 기본 설정 생성 + SystemdCgroup/Sandbox 보정
+      ansible.builtin.shell: |
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+        sed -i 's#sandbox_image = "registry.k8s.io/pause:3.8"#sandbox_image = "registry.k8s.io/pause:3.9"#' /etc/containerd/config.toml
+      notify: restart containerd
+
+    - name: (공통) 방화벽 규칙 + 영구 저장 (K8s + Calico 포트)
+      ansible.builtin.shell: |
+        for port in 6443 2379:2380 10250 10257 10259; do
+          iptables -C INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport $port -j ACCEPT
+        done
+        iptables -C INPUT -p tcp --dport 179 -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport 179 -j ACCEPT
+        iptables -C INPUT -p udp --dport 4789 -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport 4789 -j ACCEPT
+        netfilter-persistent save
+      changed_when: true
+
+    - name: (공통) containerd/kubelet 시작 및 활성화
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop: [containerd, kubelet]
+
+  handlers:
+    - name: restart containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+
+
+
+- name: "2단계 - 첫 번째 노드(CP-1) 초기화 및 조인 정보 추출"
+  hosts: k8s-cp-1
+  become: true
+  vars_prompt:
+    - name: ssh_password
+      prompt: "ubuntu 계정 sudo 비밀번호 (passwordless sudo 면 비워도 됨)"
+      private: true
+      unsafe: true
+
+  tasks:
+    - name: 클러스터 초기화 상태 확인
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: kube_init_done
+
+    - name: kubeadm init 실행 (VIP 엔드포인트)
+      ansible.builtin.command: >
+        kubeadm init
+        --control-plane-endpoint "{{ virtual_ip }}:6443"
+        --upload-certs
+        --pod-network-cidr={{ pod_cidr }}
+      register: init_output
+      when: not kube_init_done.stat.exists
+
+    - name: kubectl 사용 설정 (root)
+      ansible.builtin.shell: |
+        mkdir -p $HOME/.kube
+        cp -f /etc/kubernetes/admin.conf $HOME/.kube/config
+        chown $(id -u):$(id -g) $HOME/.kube/config
+      changed_when: false
+
+    - name: Calico 매니페스트 다운로드
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/calico.yaml"
+        dest: /tmp/calico.yaml
+        mode: '0644'
+
+    - name: Calico 이미지 레지스트리를 quay.io 로 변경 (Docker Hub rate limit 회피)
+      ansible.builtin.replace:
+        path: /tmp/calico.yaml
+        regexp: 'docker\.io/calico/'
+        replace: 'quay.io/calico/'
+
+    - name: Calico CNI 적용 (idempotent - 재실행 안전)
+      ansible.builtin.command: kubectl apply -f /tmp/calico.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_apply
+      changed_when: "'created' in calico_apply.stdout or 'configured' in calico_apply.stdout"
+
+    # 토큰/해시/cert-key 는 매 실행 시 새로 추출 (만료/유실 방지)
+    - name: 조인 정보 동적 추출
+      ansible.builtin.shell: |
+        echo "TOKEN=$(kubeadm token create)"
+        echo "HASH=$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //')"
+        echo "CERT_KEY=$(kubeadm init phase upload-certs --upload-certs 2>/dev/null | tail -n 1)"
+      register: join_info_raw
+      changed_when: false
+
+    - name: 추출된 정보를 Fact 로 등록
+      ansible.builtin.set_fact:
+        join_token: "{{ join_info_raw.stdout_lines[0].split('=')[1] }}"
+        ca_hash:    "{{ join_info_raw.stdout_lines[1].split('=')[1] }}"
+        cert_key:   "{{ join_info_raw.stdout_lines[2].split('=')[1] }}"
+
+- name: "3단계 - 나머지 컨트롤 플레인(CP-2, CP-3) 조인"
+  hosts: control_plane
+  become: true
+  vars_prompt:
+    - name: ssh_password
+      prompt: "ubuntu 계정 sudo 비밀번호 (passwordless sudo 면 비워도 됨)"
+      private: true
+      unsafe: true
+  tasks:
+    - name: 조인 상태 확인
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: node_joined
+
+    - name: 컨트롤 플레인 조인 실행
+      ansible.builtin.command: >
+        kubeadm join {{ virtual_ip }}:6443
+        --token {{ hostvars['k8s-cp-1']['join_token'] }}
+        --discovery-token-ca-cert-hash sha256:{{ hostvars['k8s-cp-1']['ca_hash'] }}
+        --control-plane --certificate-key {{ hostvars['k8s-cp-1']['cert_key'] }}
+      when:
+        - inventory_hostname != 'k8s-cp-1'
+        - not node_joined.stat.exists
+      register: join_result
+
+    - name: 조인 성공 메시지
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} 노드가 클러스터에 합류했습니다."
+      when: join_result is changed
+
+    - name: kubectl 사용 설정 (CP-2, CP-3 root)
+      ansible.builtin.shell: |
+        mkdir -p $HOME/.kube
+        cp -f /etc/kubernetes/admin.conf $HOME/.kube/config
+        chown $(id -u):$(id -g) $HOME/.kube/config
+      when:
+        - inventory_hostname != 'k8s-cp-1'
+        - join_result is changed
+      changed_when: false
