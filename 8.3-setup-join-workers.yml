@@ -1,0 +1,166 @@
+---
+- name: "8-A) 제어 노드 SSH 키페어 확인"
+  hosts: localhost
+  gather_facts: false
+  become: false
+  tasks:
+    - name: SSH 키페어 생성 (이미 있으면 건너뜀)
+      ansible.builtin.command:
+        cmd: ssh-keygen -t rsa -b 4096 -N "" -f {{ lookup('env','HOME') }}/.ssh/id_rsa
+        creates: "{{ lookup('env','HOME') }}/.ssh/id_rsa"
+
+- name: "8-B) 워커에 공개키 등록 (최초 비밀번호 접속)"
+  hosts: workers
+  gather_facts: false
+  become: false                      # ubuntu 자신의 authorized_keys 등록 -> sudo 불필요
+  tasks:
+    - name: ~/.ssh 디렉토리 보장
+      ansible.builtin.file:
+        path: ~/.ssh
+        state: directory
+        mode: '0700'
+
+    - name: authorized_keys 에 제어 노드 공개키 등록
+      ansible.posix.authorized_key:
+        user: "{{ ansible_user }}"
+        state: present
+        key: "{{ lookup('file', lookup('env','HOME') ~ '/.ssh/id_rsa.pub') }}"
+
+- name: "8-C) k8s-cp-1 에서 워커 조인 정보 추출"
+  hosts: k8s-cp-1
+  become: true
+  tasks:
+    # 워커 조인에는 토큰 + ca-cert-hash 만 필요 (cert-key 불필요)
+    - name: 토큰/해시 추출
+      ansible.builtin.shell: |
+        echo "TOKEN=$(kubeadm token create)"
+        echo "HASH=$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //')"
+      register: join_info_raw
+      changed_when: false
+
+    - name: 추출 정보를 Fact 로 등록
+      ansible.builtin.set_fact:
+        join_token: "{{ join_info_raw.stdout_lines[0].split('=')[1] }}"
+        ca_hash:    "{{ join_info_raw.stdout_lines[1].split('=')[1] }}"
+
+- name: "8-D) 워커 사전설정 + 클러스터 조인 (Ubuntu 24.04)"
+  hosts: workers
+  become: true
+  tasks:
+    - name: (공통) Swap 비활성화
+      ansible.builtin.shell: |
+        swapoff -a
+        sed -ri '/\sswap\s/s/^/#/' /etc/fstab
+      changed_when: false
+
+    - name: (공통) 커널 모듈 영구 로드 설정
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: "overlay\nbr_netfilter\n"
+        mode: '0644'
+
+    - name: (공통) 커널 모듈 즉시 로드
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop: [overlay, br_netfilter]
+
+    - name: (공통) Sysctl 설정
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        sysctl_file: /etc/sysctl.d/k8s.conf
+        reload: true
+      loop:
+        - { name: 'net.bridge.bridge-nf-call-iptables',  value: '1' }
+        - { name: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { name: 'net.ipv4.ip_forward',                 value: '1' }
+
+    - name: (공통) 사전 패키지 + containerd + iptables-persistent
+      ansible.builtin.apt:
+        name: [apt-transport-https, ca-certificates, curl, gpg, containerd, iptables-persistent]
+        state: present
+        update_cache: true
+
+    - name: (공통) apt keyrings 디렉토리
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: (공통) Kubernetes apt 저장소 GPG 키
+      ansible.builtin.shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/{{ k8s_pkg_minor }}/deb/Release.key \
+          | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: (공통) Kubernetes apt 저장소 등록
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ k8s_pkg_minor }}/deb/ /\n"
+        mode: '0644'
+
+    - name: (공통) kubelet / kubeadm / kubectl 설치
+      ansible.builtin.apt:
+        name: [kubelet, kubeadm, kubectl]
+        state: present
+        update_cache: true
+
+    - name: (공통) kube 패키지 버전 고정 (hold)
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: [kubelet, kubeadm, kubectl]
+
+    - name: (공통) Containerd 설정 (SystemdCgroup + pause:3.9)
+      ansible.builtin.shell: |
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+        sed -i 's#sandbox_image = "registry.k8s.io/pause:3.8"#sandbox_image = "registry.k8s.io/pause:3.9"#' /etc/containerd/config.toml
+      notify: restart containerd
+
+    - name: (워커) 방화벽 규칙 + 영구 저장 (kubelet/NodePort/Calico)
+      ansible.builtin.shell: |
+        # kubelet
+        iptables -C INPUT -p tcp --dport 10250 -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport 10250 -j ACCEPT
+        # NodePort 서비스 범위
+        iptables -C INPUT -p tcp --dport 30000:32767 -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport 30000:32767 -j ACCEPT
+        # Calico BGP / VXLAN
+        iptables -C INPUT -p tcp --dport 179 -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport 179 -j ACCEPT
+        iptables -C INPUT -p udp --dport 4789 -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport 4789 -j ACCEPT
+        netfilter-persistent save
+      changed_when: true
+
+    - name: (공통) containerd/kubelet 시작 및 활성화
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop: [containerd, kubelet]
+
+    - name: 조인 상태 확인
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: node_joined
+
+    - name: 워커 노드 클러스터 조인 (--control-plane 없음)
+      ansible.builtin.command: >
+        kubeadm join {{ virtual_ip }}:6443
+        --token {{ hostvars['k8s-cp-1']['join_token'] }}
+        --discovery-token-ca-cert-hash sha256:{{ hostvars['k8s-cp-1']['ca_hash'] }}
+      when: not node_joined.stat.exists
+      register: join_result
+
+    - name: 조인 결과 메시지
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} 워커가 클러스터에 합류했습니다."
+      when: join_result is changed
+
+  handlers:
+    - name: restart containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted

@@ -1,0 +1,33 @@
+---
+- name: "8.1) 워커 노드 DNS 레코드 추가"
+  hosts: dc_svrs
+  gather_facts: false
+  vars_prompt:
+    - name: win_password
+      prompt: "Windows(DC) administrator 비밀번호를 입력하세요"
+      private: true
+      unsafe: true
+  vars:
+    Worker_Records:
+      - { name: k8s-worker-1, ip: 10.10.10.31 }
+      - { name: k8s-worker-2, ip: 10.10.10.32 }
+      - { name: k8s-worker-3, ip: 10.10.10.33 }
+
+  tasks:
+    - name: Forward (A) 레코드 추가
+      community.windows.win_dns_record:
+        state: present
+        name: "{{ item.name }}"
+        type: A
+        value: "{{ item.ip }}"
+        zone: vclass.local
+      loop: "{{ Worker_Records }}"
+
+    - name: Reverse (PTR) 레코드 추가
+      community.windows.win_dns_record:
+        state: present
+        name: "{{ item.ip.split('.')[-1] }}"
+        type: PTR
+        value: "{{ item.name }}.vclass.local"
+        zone: 10.10.10.in-addr.arpa
+      loop: "{{ Worker_Records }}"

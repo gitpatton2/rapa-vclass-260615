@@ -1,0 +1,74 @@
+---
+- name: "8-2) 워커 노드 VM 배포"
+  hosts: localhost
+  gather_facts: false
+  vars_prompt:
+    - name: vcenter_password
+      prompt: "vCenter 비밀번호를 입력하세요"
+      private: true
+      unsafe: true
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"   # venv 의 python (pyVmomi 위치)
+
+    student_id: "S00"                                   ## 본인 값으로 변경
+    vcenter_hostname: "vcsa.vclass.rapa"
+    vcenter_username: "{{ student_id | lower }}@vclass.rapa"
+    datacenter_name: "Mokdong"
+    esxi_hostname: "esx-01.vclass.rapa"
+    parent_folder: "2.vClass/"
+    datastore_name: "Local-ESX-01"
+    template_linux: "Temp-Linux-1"
+    snapshot_name: "Setup"
+    vm_portgroup: "{{ student_id }}-Ansible"
+
+    Worker_VMs:
+      - { hostname: k8s-worker-1, ip: 10.10.10.31 }
+      - { hostname: k8s-worker-2, ip: 10.10.10.32 }
+      - { hostname: k8s-worker-3, ip: 10.10.10.33 }
+
+  tasks:
+    - name: 01. 워커 VM 배포
+      community.vmware.vmware_guest:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: false
+        name: "{{ student_id }}-{{ item.hostname }}"
+        state: poweredon
+        datacenter: "{{ datacenter_name }}"
+        folder: "{{ parent_folder }}{{ student_id }}"
+        esxi_hostname: "{{ esxi_hostname }}"
+        datastore: "{{ datastore_name }}"
+        template: "{{ template_linux }}"
+        linked_clone: true
+        snapshot_src: "{{ snapshot_name }}"
+        networks:
+          - name: "{{ vm_portgroup }}"
+            label: "Network adapter 1"
+            connected: true
+            start_connected: true
+            ip: "{{ item.ip }}"
+            netmask: 255.255.255.0
+            gateway: 10.10.10.1
+        customization:
+          domain: vclass.local
+          hostname: "{{ item.hostname }}"
+          dns_servers:
+            - 10.10.10.1
+          dns_suffix:
+            - vclass.local
+      loop: "{{ Worker_VMs }}"
+      delegate_to: localhost
+
+    - name: 02. 네트워크 어댑터 연결 확인
+      community.vmware.vmware_guest_network:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: false
+        folder: "{{ parent_folder }}{{ student_id }}"
+        name: "{{ student_id }}-{{ item.hostname }}"
+        label: "Network adapter 1"
+        network_name: "{{ vm_portgroup }}"
+      loop: "{{ Worker_VMs }}"
+      delegate_to: localhost
